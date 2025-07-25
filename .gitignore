@@ -1,5 +1,6 @@
 # MRI Data files (large files)
 IXI-T1/
+IXI-T1-sorted/
 templates/
 
 # Output directories
@@ -115,6 +116,7 @@ Thumbs.db
 *.bmp
 *.gif
 
+organised_by_age/
 # NIfTI files (if you want to exclude them)
 # *.nii
 # *.nii.gz 

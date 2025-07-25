@@ -1,6 +1,22 @@
-# MRI Preprocessing Pipeline
+# MRI Preprocessing & Brain Age Prediction Pipeline
 
-A comprehensive preprocessing pipeline for T1-weighted MRI images that includes denoising, bias field correction, intensity normalization, registration to MNI152 template, and skull stripping.
+This project implements a comprehensive pipeline for brain age prediction from T1-weighted MRI images. The pipeline includes advanced preprocessing, deep learning model training, and evaluation, enabling robust prediction of brain age from raw MRI data.
+
+## Brain Age Prediction Pipeline & Results
+
+The pipeline consists of the following stages:
+
+1. **Preprocessing**: Each T1-weighted MRI image undergoes denoising, bias field correction, intensity normalization, registration to the MNI152 template, and skull stripping. These steps standardize and clean the data for optimal model performance.
+2. **Model Training**: A 3D ResNet-based deep learning model is trained on the preprocessed images to predict brain age categories. The model leverages volumetric features and spatial context for accurate classification.
+3. **Evaluation**: The model's performance is evaluated on a held-out validation set. Training and validation accuracy/loss curves are generated, and the best model is selected based on validation accuracy.
+
+**Results:**
+- **Best Validation Accuracy:** 0.89
+- **Best Validation Loss:** 0.15
+- **Visualizations:**
+  - Training/validation accuracy and loss curves: [`results/accuracy_loss_curves.png`]
+
+For more details on the pipeline steps, see below.
 
 ## Features
 
