@@ -3,6 +3,12 @@
 MRI Preprocessing Pipeline for T1-weighted Images
 ================================================
 
+Colab Usage Notes:
+- Install dependencies in a Colab cell before running:
+    !pip install SimpleITK nibabel scikit-image matplotlib
+- Output will be saved to /content/preprocessed (Colab local disk, not persistent).
+- Download results from the Colab file browser or with files.download.
+
 This pipeline performs the following preprocessing steps:
 1. Image denoising
 2. Bias field correction and visualization
@@ -20,11 +26,32 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter
-from scipy.optimize import minimize
 from skimage import filters, morphology, measure
 from skimage.restoration import denoise_bilateral, denoise_tv_chambolle
 import warnings
 warnings.filterwarnings('ignore')
+# Add SimpleITK for N4 bias correction and registration
+import SimpleITK as sitk
+from concurrent.futures import ProcessPoolExecutor
+
+# Move process_image_wrapper to module level for Windows/Colab compatibility
+
+def process_image_wrapper(args):
+    pipeline_config, input_file, rel_prefix = args
+    # Mirror subfolder structure in output_dir
+    out_dir = os.path.join(pipeline_config['output_dir'], os.path.dirname(rel_prefix))
+    os.makedirs(out_dir, exist_ok=True)
+    output_prefix = os.path.join(out_dir, os.path.splitext(os.path.basename(rel_prefix))[0])
+    # Re-instantiate pipeline in subprocess
+    pipeline = MRIPreprocessingPipeline(
+        input_dir=pipeline_config['input_dir'],
+        template_dir=pipeline_config['template_dir'],
+        output_dir=pipeline_config['output_dir']
+    )
+    try:
+        pipeline.preprocess_single_image(input_file, output_prefix)
+    except Exception as e:
+        print(f"Error processing {input_file}: {e}")
 
 class MRIPreprocessingPipeline:
     """
@@ -47,20 +74,14 @@ class MRIPreprocessingPipeline:
         self.input_dir = input_dir
         self.template_dir = template_dir
         self.output_dir = output_dir
-        
-        # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Load MNI152 template
         self.template_path = os.path.join(template_dir, "mni_icbm152_t1_tal_nlin_sym_09a.nii")
         self.template_mask_path = os.path.join(template_dir, "mni_icbm152_t1_tal_nlin_sym_09a_mask.nii")
-        
         if os.path.exists(self.template_path):
             self.template_img = nib.load(self.template_path)
             self.template_data = self.template_img.get_fdata()
         else:
             raise FileNotFoundError(f"Template file not found: {self.template_path}")
-            
         if os.path.exists(self.template_mask_path):
             self.template_mask_img = nib.load(self.template_mask_path)
             self.template_mask_data = self.template_mask_img.get_fdata()
@@ -376,47 +397,35 @@ class MRIPreprocessingPipeline:
         
         return normalized
     
-    def register_to_template(self, img_data, img_affine, method='affine'):
+    def fast_gaussian_bias_correction(self, img_path):
+        print("Applying fast Gaussian bias field correction...")
+        img = nib.load(img_path)
+        data = img.get_fdata()
+        # Estimate bias field as heavy Gaussian smoothing
+        bias_field = gaussian_filter(data, sigma=20)
+        bias_field_mean = np.mean(bias_field)
+        bias_field = bias_field / bias_field_mean
+        bias_field = np.clip(bias_field, 0.8, 1.2)
+        corrected = data / bias_field
+        # Normalize to original intensity range
+        corrected = np.clip(corrected, np.percentile(data[data > 0], 1), np.percentile(data[data > 0], 99))
+        return corrected, img.affine, img
+
+    def improved_register_to_template(self, moving_img_sitk, template_img_sitk):
         """
-        Register image to MNI152 template.
-        
-        Parameters:
-        -----------
-        img_data : numpy.ndarray
-            Input image data
-        img_affine : numpy.ndarray
-            Affine transformation matrix of input image
-        method : str
-            Registration method ('affine', 'rigid')
-            
-        Returns:
-        --------
-        tuple
-            (registered_data, registered_affine)
+        Register moving_img_sitk to template_img_sitk using SimpleITK affine registration.
+        Returns registered numpy array and SimpleITK image.
         """
-        print("Registering to MNI152 template...")
-        
-        # For simplicity, we'll use a basic affine registration
-        # In practice, you might want to use more sophisticated methods like ANTs or FSL
-        
-        # Create a simple affine transformation
-        # This is a simplified version - in practice, you'd use proper registration algorithms
-        
-        # Resize image to match template dimensions
-        target_shape = self.template_data.shape
-        
-        # Simple resizing (in practice, use proper interpolation)
-        from scipy.ndimage import zoom
-        
-        zoom_factors = [target_shape[i] / img_data.shape[i] for i in range(3)]
-        registered_data = zoom(img_data, zoom_factors, order=1)
-        
-        # Update affine matrix
-        registered_affine = img_affine.copy()
-        for i in range(3):
-            registered_affine[i, i] *= zoom_factors[i]
-        
-        return registered_data, registered_affine
+        print("Registering to MNI152 template using SimpleITK...")
+        registration_method = sitk.ImageRegistrationMethod()
+        registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+        registration_method.SetOptimizerAsGradientDescent(learningRate=1.0, numberOfIterations=100)
+        registration_method.SetInterpolator(sitk.sitkLinear)
+        registration_method.SetInitialTransform(sitk.CenteredTransformInitializer(
+            template_img_sitk, moving_img_sitk, sitk.AffineTransform(3), sitk.CenteredTransformInitializerFilter.GEOMETRY))
+        final_transform = registration_method.Execute(template_img_sitk, moving_img_sitk)
+        resampled = sitk.Resample(moving_img_sitk, template_img_sitk, final_transform, sitk.sitkLinear, 0.0, moving_img_sitk.GetPixelID())
+        return sitk.GetArrayFromImage(resampled), resampled
     
     def skull_stripping(self, img_data, method='robust', use_center_mask=True):
         """
@@ -680,80 +689,58 @@ class MRIPreprocessingPipeline:
         return refined_mask
     
     def preprocess_single_image(self, input_file, output_prefix):
-        """
-        Preprocess a single MRI image through the complete pipeline.
-        
-        Parameters:
-        -----------
-        input_file : str
-            Path to input NIfTI file
-        output_prefix : str
-            Prefix for output files
-            
-        Returns:
-        --------
-        dict
-            Dictionary containing all intermediate and final results
-        """
         print(f"\nProcessing: {input_file}")
-        
         try:
-            # Load image
-            img = self.load_image(input_file)
-            img_data = img.get_fdata()
-            img_affine = img.affine
-            
-            # Validate image data
-            if img_data is None or img_data.size == 0:
-                raise ValueError("Empty or invalid image data")
-            
-            if np.isnan(img_data).any() or np.isinf(img_data).any():
-                print("Warning: Image contains NaN or Inf values, cleaning...")
-                img_data = np.nan_to_num(img_data, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            results = {
-                'original': img_data,
-                'affine': img_affine
-            }
-            
-            # Step 1: Denoising
+            # Use fast Gaussian bias correction instead of N4
+            corrected_np, img_affine, orig_img = self.fast_gaussian_bias_correction(input_file)
+            results = {'original': corrected_np, 'affine': img_affine}
+
+            # Denoising (optional, can be skipped if bias correction is robust)
             try:
-                denoised = self.denoise_image(img_data)
+                denoised = self.denoise_image(corrected_np)
                 results['denoised'] = denoised
             except Exception as e:
-                print(f"Warning: Denoising failed, using original data: {str(e)}")
-                results['denoised'] = img_data
-            
-            # Step 2: Bias field correction
+                print(f"Warning: Denoising failed, using bias corrected data: {str(e)}")
+                results['denoised'] = corrected_np
+
+            # Intensity normalization
             try:
-                bias_field = self.estimate_bias_field(results['denoised'], method='conservative')
-                bias_corrected = self.correct_bias_field(results['denoised'], bias_field)
-                results['bias_field'] = bias_field
-                results['bias_corrected'] = bias_corrected
-            except Exception as e:
-                print(f"Warning: Bias field correction failed, using denoised data: {str(e)}")
-                results['bias_field'] = np.ones_like(results['denoised'])
-                results['bias_corrected'] = results['denoised']
-            
-            # Step 3: Intensity normalization
-            try:
-                normalized = self.normalize_intensity(results['bias_corrected'])
+                normalized = self.normalize_intensity(results['denoised'])
                 results['normalized'] = normalized
             except Exception as e:
-                print(f"Warning: Intensity normalization failed, using bias corrected data: {str(e)}")
-                results['normalized'] = results['bias_corrected']
-            
-            # Step 4: Registration to template
+                print(f"Warning: Intensity normalization failed, using denoised data: {str(e)}")
+                results['normalized'] = results['denoised']
+
+            # Ensure normalized is 3D
+            norm = results['normalized']
+            if norm.ndim == 4 and norm.shape[-1] == 1:
+                norm = norm[..., 0]
+            elif norm.ndim != 3:
+                raise ValueError(f"Normalized image is not 3D: shape={norm.shape}")
+            results['normalized'] = norm
+            print(f"Normalized shape: {results['normalized'].shape}, Template shape: {self.template_data.shape}")
+
+            # Prepare moving image for registration
+            template_sitk = sitk.ReadImage(self.template_path)
+            moving_sitk = sitk.GetImageFromArray(results['normalized'])
+            moving_sitk.SetSpacing(template_sitk.GetSpacing())
+            moving_sitk.SetOrigin(template_sitk.GetOrigin())
+            moving_sitk.SetDirection(template_sitk.GetDirection())
+            moving_sitk = sitk.Cast(moving_sitk, sitk.sitkFloat32)
+            template_sitk = sitk.Cast(template_sitk, sitk.sitkFloat32)
+
+            # Improved registration to template
             try:
-                registered, registered_affine = self.register_to_template(results['normalized'], img_affine)
-                results['registered'] = registered
-                results['registered_affine'] = registered_affine
+                registered_np, registered_sitk = self.improved_register_to_template(
+                    moving_sitk, template_sitk)
+                results['registered'] = registered_np
+                results['registered_affine'] = np.eye(4)
             except Exception as e:
                 print(f"Warning: Registration failed, using normalized data: {str(e)}")
                 results['registered'] = results['normalized']
-                results['registered_affine'] = img_affine
-            
-            # Step 5: Skull stripping
+                results['registered_affine'] = np.eye(4)
+
+            # Skull stripping (as before)
             try:
                 stripped, brain_mask = self.skull_stripping(results['registered'])
                 results['stripped'] = stripped
@@ -762,66 +749,32 @@ class MRIPreprocessingPipeline:
                 print(f"Warning: Skull stripping failed, using registered data: {str(e)}")
                 results['stripped'] = results['registered']
                 results['brain_mask'] = np.ones_like(results['registered'], dtype=bool)
-            
+
             # Save results
             self.save_results(results, output_prefix)
-            
-            # Create visualizations
             try:
                 self.create_visualizations(results, output_prefix)
             except Exception as e:
                 print(f"Warning: Visualization creation failed: {str(e)}")
-            
             return results
-            
         except Exception as e:
             print(f"Error processing {input_file}: {str(e)}")
             raise
-    
+
     def save_results(self, results, output_prefix):
         """
-        Save preprocessing results to files.
-        
-        Parameters:
-        -----------
-        results : dict
-            Dictionary containing preprocessing results
-        output_prefix : str
-            Prefix for output files
+        Save only the final preprocessed image to files.
         """
         print("Saving results...")
-        
-        # Get affine matrices with fallbacks
         registered_affine = results.get('registered_affine', results.get('affine'))
-        original_affine = results.get('affine')
-        
-        # Save final preprocessed image
+        # Save only the final preprocessed image
         if 'stripped' in results:
             final_img = nib.Nifti1Image(results['stripped'], registered_affine)
-            nib.save(final_img, os.path.join(self.output_dir, f"{output_prefix}_preprocessed.nii.gz"))
-        
-        # Save brain mask
-        if 'brain_mask' in results:
-            mask_img = nib.Nifti1Image(results['brain_mask'].astype(np.uint8), registered_affine)
-            nib.save(mask_img, os.path.join(self.output_dir, f"{output_prefix}_brain_mask.nii.gz"))
-        
-        # Save intermediate results
-        if 'denoised' in results:
-            denoised_img = nib.Nifti1Image(results['denoised'], original_affine)
-            nib.save(denoised_img, os.path.join(self.output_dir, f"{output_prefix}_denoised.nii.gz"))
-        
-        if 'bias_corrected' in results:
-            bias_corrected_img = nib.Nifti1Image(results['bias_corrected'], original_affine)
-            nib.save(bias_corrected_img, os.path.join(self.output_dir, f"{output_prefix}_bias_corrected.nii.gz"))
-        
-        if 'normalized' in results:
-            normalized_img = nib.Nifti1Image(results['normalized'], original_affine)
-            nib.save(normalized_img, os.path.join(self.output_dir, f"{output_prefix}_normalized.nii.gz"))
-        
-        if 'registered' in results:
-            registered_img = nib.Nifti1Image(results['registered'], registered_affine)
-            nib.save(registered_img, os.path.join(self.output_dir, f"{output_prefix}_registered.nii.gz"))
-    
+            out_path = f"{output_prefix}_preprocessed.nii.gz"
+            print(f"Saving preprocessed image to: {out_path}")
+            nib.save(final_img, out_path)
+            print(f"Saved preprocessed file: {out_path}")
+
     def create_visualizations(self, results, output_prefix):
         """
         Create visualizations of preprocessing steps.
@@ -898,33 +851,37 @@ class MRIPreprocessingPipeline:
         plt.close()
     
     def process_all_images(self):
-        """
-        Process all T1-weighted images in the input directory.
-        """
-        print("Starting batch processing of all T1-weighted images...")
-        
-        # Get all .nii.gz files in the input directory
-        input_files = [f for f in os.listdir(self.input_dir) if f.endswith('.nii.gz')]
-        
+        print("Starting parallel batch processing of all T1-weighted images...")
+        os.makedirs(self.output_dir, exist_ok=True)
+        input_files = []
+        for root, dirs, files in os.walk(self.input_dir):
+            for file in files:
+                if file.endswith('.nii.gz'):
+                    input_files.append(os.path.join(root, file))
         if not input_files:
             print(f"No .nii.gz files found in {self.input_dir}")
             return
-        
         print(f"Found {len(input_files)} files to process")
-        
-        for i, filename in enumerate(input_files):
-            print(f"\nProcessing file {i+1}/{len(input_files)}: {filename}")
-            
-            input_path = os.path.join(self.input_dir, filename)
-            output_prefix = filename.replace('.nii.gz', '')
-            
-            try:
-                results = self.preprocess_single_image(input_path, output_prefix)
-                print(f"Successfully processed: {filename}")
-            except Exception as e:
-                print(f"Error processing {filename}: {str(e)}")
+        args_list = []
+        for f in input_files:
+            rel_path = os.path.relpath(f, self.input_dir)
+            rel_prefix = os.path.splitext(rel_path)[0]
+            out_dir = os.path.join(self.output_dir, os.path.dirname(rel_prefix))
+            os.makedirs(out_dir, exist_ok=True)
+            output_prefix = os.path.join(out_dir, os.path.splitext(os.path.basename(rel_prefix))[0])
+            preprocessed_file = f"{output_prefix}_preprocessed.nii.gz"
+            if os.path.exists(preprocessed_file):
+                print(f"Skipping {f} (already preprocessed)")
                 continue
-        
+            pipeline_config = {
+                'input_dir': self.input_dir,
+                'template_dir': self.template_dir,
+                'output_dir': self.output_dir
+            }
+            args_list.append((pipeline_config, f, rel_prefix))
+        # On Colab, you can try 2-4 workers, or more if you have high-RAM
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            executor.map(process_image_wrapper, args_list)
         print(f"\nBatch processing completed. Results saved in: {self.output_dir}")
 
 
